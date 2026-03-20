@@ -1,47 +1,62 @@
 # PremierVision EPL Predictor
 
-A Streamlit app that predicts EPL match outcomes using a trained TensorFlow model.
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-App-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
+[![TensorFlow](https://img.shields.io/badge/TensorFlow-Model-FF6F00?logo=tensorflow&logoColor=white)](https://www.tensorflow.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-## Project Files
+PremierVision is a Streamlit web app that predicts EPL match outcomes (Home Win, Draw, Away Win) using a trained TensorFlow model.
 
-- app.py: Streamlit web app
-- epl_final.csv: EPL match dataset used for team statistics and feature generation
-- epl_model.keras: Trained prediction model
+## Why This Project
+
+- Interactive EPL matchup prediction with a clean UI.
+- Stable outputs for repeated runs with the same input matchup.
+- Input features are generated from real season-level team statistics.
+- Ready to run locally with a simple Python setup.
+
+## Tech Stack
+
+- Python
+- Streamlit
+- TensorFlow / Keras
+- Pandas and NumPy
+- Altair
+
+## Project Structure
+
+- app.py: Main Streamlit application
+- epl_final.csv: EPL dataset used for statistics and feature engineering
+- epl_model.keras: Trained model artifact
 - scaler.pkl: Saved scaler artifact from model training workflow
+- requirements.txt: Python dependencies
+- .gitignore: Git ignore rules
+
+## How Predictions Work
+
+1. You select season, home team, and away team.
+2. Team profiles are built from season stats:
+	 goals, shots, shots on target, corners, fouls, yellow cards, red cards, and points per match.
+3. Profiles are converted to a 36-feature vector to match the model input shape.
+4. The model returns probabilities for Away Win, Draw, and Home Win.
 
 ## Run Locally
 
-1. Open terminal in this folder.
-2. Create and activate virtual environment.
-3. Install dependencies.
-4. Start Streamlit app.
-
-PowerShell commands:
-
+```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python -m streamlit run app.py
+```
 
-## Notes on Predictions
+## Portfolio Polish Checklist
 
-- Repeated runs with the same season and same home/away teams are stable.
-- Inputs are built from real season statistics (goals, shots, corners, fouls, cards, points per match) and mapped to the model's expected 36-feature input.
+- Add a repo description:
+	AI-powered EPL outcome prediction app built with Streamlit and TensorFlow.
+- Add topics:
+	streamlit, tensorflow, machine-learning, football, premier-league, sports-analytics, python, data-science.
+- Add a social preview image (1280x640) from an app screenshot.
+- Pin this repo on your GitHub profile.
 
-## Publish To GitHub
+## License
 
-Your current global git root appears to be your Desktop. To publish only this project, initialize git inside this folder.
-
-PowerShell commands:
-
-cd C:\Users\dipen\OneDrive\Desktop\Dipendra\EPL_Project
-git init
-git add .
-git commit -m "Initial commit: PremierVision EPL Predictor"
-git branch -M main
-git remote add origin https://github.com/<your-username>/<your-repo-name>.git
-git push -u origin main
-
-If remote already exists, run:
-
-git remote set-url origin https://github.com/<your-username>/<your-repo-name>.git
+This project is licensed under the MIT License.
