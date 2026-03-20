@@ -380,6 +380,10 @@ def _team_total_points(season_data, team):
     return float(points)
 
 
+def _team_total_matches(season_data, team):
+    return int((season_data["HomeTeam"] == team).sum() + (season_data["AwayTeam"] == team).sum())
+
+
 def _team_form_points(matches, side, window=5):
     if matches.empty or "FullTimeResult" not in matches.columns:
         return 1.2
@@ -557,6 +561,47 @@ def compute_poisson_probabilities(season_data, home_team, away_team, max_goals=7
     return probs
 
 
+def compute_rating_probabilities(season_data, home_team, away_team):
+    teams = sorted(set(season_data["HomeTeam"]).union(set(season_data["AwayTeam"])))
+    league_avg_ppm = 1.35
+    all_ppm = []
+    for t in teams:
+        m = _team_total_matches(season_data, t)
+        if m > 0:
+            all_ppm.append(_team_total_points(season_data, t) / m)
+    if all_ppm:
+        league_avg_ppm = float(np.mean(all_ppm))
+
+    def smoothed_ppm(team):
+        m = _team_total_matches(season_data, team)
+        p = _team_total_points(season_data, team)
+        # Bayesian smoothing to avoid extreme ratings with few matches.
+        return float((p + 8 * league_avg_ppm) / max(m + 8, 1))
+
+    home_ppm = smoothed_ppm(home_team)
+    away_ppm = smoothed_ppm(away_team)
+    strength_diff = home_ppm - away_ppm
+
+    # Add modest home-field advantage in rating space.
+    home_advantage = 0.22
+    margin = strength_diff + home_advantage
+
+    # Convert margin to non-draw split.
+    home_non_draw = 1.0 / (1.0 + np.exp(-2.2 * margin))
+    away_non_draw = 1.0 - home_non_draw
+
+    # Draw chance decreases as mismatch grows.
+    draw_prob = 0.32 * np.exp(-1.10 * abs(margin))
+    draw_prob = float(np.clip(draw_prob, 0.18, 0.34))
+
+    remainder = 1.0 - draw_prob
+    home_prob = remainder * home_non_draw
+    away_prob = remainder * away_non_draw
+
+    probs = np.asarray([home_prob, draw_prob, away_prob], dtype=np.float32)
+    return probs / max(float(probs.sum()), 1e-8)
+
+
 # 3. BUILD SLIDER HTML
 
 logos_html = ""
@@ -646,14 +691,19 @@ with col_btn_2:
                     model_probs = 0.65 * model_probs + 0.35 * np.asarray([1/3, 1/3, 1/3], dtype=np.float32)
 
                 poisson_probs = compute_poisson_probabilities(season_data, home_team, away_team)
+                rating_probs = compute_rating_probabilities(season_data, home_team, away_team)
 
-                # Hybrid forecast: data-driven Poisson baseline + neural model signal.
-                prediction = 0.8 * poisson_probs + 0.2 * model_probs
+                # Hybrid forecast balances rating, Poisson, and model signal.
+                prediction = 0.55 * rating_probs + 0.35 * poisson_probs + 0.10 * model_probs
+                balance = 1.0 - abs(float(rating_probs[0] - rating_probs[2]))
+                draw_uplift = 0.08 * max(balance, 0.0)
+                prediction[1] = prediction[1] + draw_uplift
                 prediction = prediction / max(prediction.sum(), 1e-8)
                 st.session_state['prediction'] = prediction
                 st.session_state['prediction_debug'] = {
                     'model_probs': model_probs,
                     'poisson_probs': poisson_probs,
+                    'rating_probs': rating_probs,
                     'final_probs': prediction,
                     'home_team': home_team,
                     'away_team': away_team,
@@ -724,10 +774,11 @@ if st.session_state['prediction'] is not None:
             debug_df = pd.DataFrame({
                 'Outcome': ['HOME WIN', 'DRAW', 'AWAY WIN'],
                 'Model': np.round(np.asarray(debug_payload['model_probs']) * 100, 2),
+                'Rating': np.round(np.asarray(debug_payload['rating_probs']) * 100, 2),
                 'Poisson': np.round(np.asarray(debug_payload['poisson_probs']) * 100, 2),
                 'Final': np.round(np.asarray(debug_payload['final_probs']) * 100, 2),
             })
             st.dataframe(debug_df, use_container_width=True, hide_index=True)
-            st.caption("Final = 80% Poisson + 20% Model (with confidence damping when model is too sharp).")
+            st.caption("Final = 55% Rating + 35% Poisson + 10% Model (with confidence damping when model is too sharp).")
 
 st.markdown('</div>', unsafe_allow_html=True)
