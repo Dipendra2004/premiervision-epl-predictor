@@ -4,6 +4,11 @@ import numpy as np
 import time
 import os
 import altair as alt
+import math
+try:
+    import joblib
+except ModuleNotFoundError:
+    joblib = None
 
 # Reduce TensorFlow startup noise in Streamlit logs.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -230,6 +235,8 @@ st.markdown("""
 
 if 'prediction' not in st.session_state:
     st.session_state['prediction'] = None
+if 'prediction_debug' not in st.session_state:
+    st.session_state['prediction_debug'] = None
 
 # --- LOGO MAPPING ---
 logo_map = {
@@ -290,11 +297,26 @@ def load_model():
                 draw_score = x[:, 1] * 1.2 + x[:, 5] * 0.4
                 away_score = x[:, 2] * 1.4 + x[:, 3] * 0.6
 
-                logits = np.stack([away_score, draw_score, home_score], axis=1)
+                logits = np.stack([home_score, draw_score, away_score], axis=1)
                 logits = logits - logits.max(axis=1, keepdims=True)
                 exp_logits = np.exp(logits)
                 return exp_logits / exp_logits.sum(axis=1, keepdims=True)
         return MockModel()
+
+
+@st.cache_resource
+def load_scaler():
+    if os.path.exists("scaler.pkl") and joblib is not None:
+        try:
+            return joblib.load("scaler.pkl")
+        except Exception:
+            pass
+
+    class IdentityScaler:
+        def transform(self, x):
+            return x
+
+    return IdentityScaler()
 
 @st.cache_data
 def load_data():
@@ -314,137 +336,225 @@ def load_data():
         return pd.DataFrame(data)
 
 model = load_model()
+scaler = load_scaler()
 df = load_data()
 
+MODEL_FEATURE_ORDER = [
+    "HomeShots", "AwayShots", "HomeShotsOnTarget", "AwayShotsOnTarget",
+    "HomeCorners", "AwayCorners", "HomeFouls", "AwayFouls", "HY", "AY", "HR", "AR",
+    "HomeForm", "AwayForm", "FormDiff", "HomeAdvantage", "ShotsDiff",
+    "ShotsOnTargetDiff", "FoulsDiff", "YellowDiff", "RedDiff",
+    "HomeAvgGoalsScored", "HomeAvgGoalsConceded", "AwayAvgGoalsScored",
+    "AwayAvgGoalsConceded", "HomeGoalDiffTrend", "AwayGoalDiffTrend",
+    "MatchNumber", "TotalMatches", "SeasonProgress", "SeasonAvgPoints_Home",
+    "SeasonAvgPoints_Away", "Points_HomeBefore", "Points_AwayBefore",
+    "PointsGap_HomeAway", "RelegationPressure_Home",
+]
 
-def _safe_column_mean(frame, column_name, default_value):
+
+def _safe_mean(frame, column_name, default_value=0.0):
     if column_name not in frame.columns:
         return float(default_value)
-    values = pd.to_numeric(frame[column_name], errors="coerce").dropna()
-    if values.empty:
+    series = pd.to_numeric(frame[column_name], errors="coerce").dropna()
+    if series.empty:
         return float(default_value)
-    return float(values.mean())
+    return float(series.mean())
 
 
-def _get_season_baselines(season_data):
-    default_goals = 1.2
-    return {
-        "gf_home": _safe_column_mean(season_data, "FTHG", default_goals),
-        "ga_home": _safe_column_mean(season_data, "FTAG", default_goals),
-        "sf_home": _safe_column_mean(season_data, "HomeShots", 12.0),
-        "sa_home": _safe_column_mean(season_data, "AwayShots", 12.0),
-        "sotf_home": _safe_column_mean(season_data, "HomeShotsOnTarget", 4.5),
-        "sota_home": _safe_column_mean(season_data, "AwayShotsOnTarget", 4.5),
-        "cf_home": _safe_column_mean(season_data, "HomeCorners", 5.0),
-        "ca_home": _safe_column_mean(season_data, "AwayCorners", 5.0),
-        "ff_home": _safe_column_mean(season_data, "HomeFouls", 11.0),
-        "fa_home": _safe_column_mean(season_data, "AwayFouls", 11.0),
-        "yc_home": _safe_column_mean(season_data, "HY", 2.0),
-        "rc_home": _safe_column_mean(season_data, "HR", 0.08),
-        "gf_away": _safe_column_mean(season_data, "FTAG", default_goals),
-        "ga_away": _safe_column_mean(season_data, "FTHG", default_goals),
-        "sf_away": _safe_column_mean(season_data, "AwayShots", 12.0),
-        "sa_away": _safe_column_mean(season_data, "HomeShots", 12.0),
-        "sotf_away": _safe_column_mean(season_data, "AwayShotsOnTarget", 4.5),
-        "sota_away": _safe_column_mean(season_data, "HomeShotsOnTarget", 4.5),
-        "cf_away": _safe_column_mean(season_data, "AwayCorners", 5.0),
-        "ca_away": _safe_column_mean(season_data, "HomeCorners", 5.0),
-        "ff_away": _safe_column_mean(season_data, "AwayFouls", 11.0),
-        "fa_away": _safe_column_mean(season_data, "HomeFouls", 11.0),
-        "yc_away": _safe_column_mean(season_data, "AY", 2.0),
-        "rc_away": _safe_column_mean(season_data, "AR", 0.08),
-        "ppm": 1.33,
+def _points_from_result(result, side):
+    if pd.isna(result):
+        return 0
+    if side == "home":
+        return 3 if result == "H" else 1 if result == "D" else 0
+    return 3 if result == "A" else 1 if result == "D" else 0
+
+
+def _team_total_points(season_data, team):
+    points = 0
+    if "FullTimeResult" not in season_data.columns:
+        return 0.0
+    home_rows = season_data[season_data["HomeTeam"] == team]
+    away_rows = season_data[season_data["AwayTeam"] == team]
+    points += sum(_points_from_result(r, "home") for r in home_rows["FullTimeResult"])
+    points += sum(_points_from_result(r, "away") for r in away_rows["FullTimeResult"])
+    return float(points)
+
+
+def _team_form_points(matches, side, window=5):
+    if matches.empty or "FullTimeResult" not in matches.columns:
+        return 1.2
+    recent = matches.tail(window)
+    pts = sum(_points_from_result(r, side) for r in recent["FullTimeResult"])
+    return float(pts / max(len(recent), 1))
+
+
+def _league_table_rank(season_data, team):
+    teams = sorted(set(season_data["HomeTeam"]).union(set(season_data["AwayTeam"])))
+    standings = []
+    for t in teams:
+        points = _team_total_points(season_data, t)
+        gf = _safe_mean(season_data[season_data["HomeTeam"] == t], "FTHG", 0.0) * max(len(season_data[season_data["HomeTeam"] == t]), 1)
+        gf += _safe_mean(season_data[season_data["AwayTeam"] == t], "FTAG", 0.0) * max(len(season_data[season_data["AwayTeam"] == t]), 1)
+        ga = _safe_mean(season_data[season_data["HomeTeam"] == t], "FTAG", 0.0) * max(len(season_data[season_data["HomeTeam"] == t]), 1)
+        ga += _safe_mean(season_data[season_data["AwayTeam"] == t], "FTHG", 0.0) * max(len(season_data[season_data["AwayTeam"] == t]), 1)
+        standings.append((t, points, gf - ga, gf))
+
+    standings.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
+    for idx, (name, _, _, _) in enumerate(standings, start=1):
+        if name == team:
+            return idx
+    return len(standings)
+
+
+def build_model_input_from_stats(season_data, home_team, away_team):
+    season_df = season_data.copy()
+    if "MatchDate" in season_df.columns:
+        season_df["MatchDate"] = pd.to_datetime(season_df["MatchDate"], errors="coerce")
+        season_df = season_df.sort_values("MatchDate")
+
+    home_rows = season_df[season_df["HomeTeam"] == home_team]
+    away_rows = season_df[season_df["AwayTeam"] == away_team]
+
+    home_shots = _safe_mean(home_rows, "HomeShots", _safe_mean(season_df, "HomeShots", 12.0))
+    away_shots = _safe_mean(away_rows, "AwayShots", _safe_mean(season_df, "AwayShots", 11.0))
+    home_sot = _safe_mean(home_rows, "HomeShotsOnTarget", _safe_mean(season_df, "HomeShotsOnTarget", 4.5))
+    away_sot = _safe_mean(away_rows, "AwayShotsOnTarget", _safe_mean(season_df, "AwayShotsOnTarget", 4.0))
+    home_corners = _safe_mean(home_rows, "HomeCorners", _safe_mean(season_df, "HomeCorners", 5.0))
+    away_corners = _safe_mean(away_rows, "AwayCorners", _safe_mean(season_df, "AwayCorners", 4.5))
+    home_fouls = _safe_mean(home_rows, "HomeFouls", _safe_mean(season_df, "HomeFouls", 11.0))
+    away_fouls = _safe_mean(away_rows, "AwayFouls", _safe_mean(season_df, "AwayFouls", 11.0))
+    home_yellow = _safe_mean(home_rows, "HY", _safe_mean(season_df, "HY", 2.0))
+    away_yellow = _safe_mean(away_rows, "AY", _safe_mean(season_df, "AY", 2.0))
+    home_red = _safe_mean(home_rows, "HR", _safe_mean(season_df, "HR", 0.08))
+    away_red = _safe_mean(away_rows, "AR", _safe_mean(season_df, "AR", 0.08))
+
+    home_form = _team_form_points(home_rows, "home")
+    away_form = _team_form_points(away_rows, "away")
+
+    home_avg_scored = _safe_mean(home_rows, "FTHG", _safe_mean(season_df, "FTHG", 1.4))
+    home_avg_conceded = _safe_mean(home_rows, "FTAG", _safe_mean(season_df, "FTAG", 1.2))
+    away_avg_scored = _safe_mean(away_rows, "FTAG", _safe_mean(season_df, "FTAG", 1.2))
+    away_avg_conceded = _safe_mean(away_rows, "FTHG", _safe_mean(season_df, "FTHG", 1.4))
+
+    home_goal_diff_trend = _safe_mean(home_rows.tail(5).assign(diff=lambda x: x["FTHG"] - x["FTAG"]), "diff", 0.0)
+    away_goal_diff_trend = _safe_mean(away_rows.tail(5).assign(diff=lambda x: x["FTAG"] - x["FTHG"]), "diff", 0.0)
+
+    total_matches = float(max(len(season_df), 1))
+    match_number = float(min(len(home_rows), len(away_rows)) + 1)
+    season_progress = min(match_number / total_matches, 1.0)
+
+    if "FullTimeResult" in season_df.columns:
+        season_avg_points_home = float(np.mean([
+            _points_from_result(r, "home") for r in season_df["FullTimeResult"]
+        ]))
+        season_avg_points_away = float(np.mean([
+            _points_from_result(r, "away") for r in season_df["FullTimeResult"]
+        ]))
+    else:
+        season_avg_points_home = 1.35
+        season_avg_points_away = 1.10
+
+    points_home_before = _team_total_points(season_df, home_team)
+    points_away_before = _team_total_points(season_df, away_team)
+    points_gap = points_home_before - points_away_before
+
+    home_rank = _league_table_rank(season_df, home_team)
+    relegation_pressure_home = 1.0 if home_rank >= 16 else 0.0
+
+    feature_values = {
+        "HomeShots": home_shots,
+        "AwayShots": away_shots,
+        "HomeShotsOnTarget": home_sot,
+        "AwayShotsOnTarget": away_sot,
+        "HomeCorners": home_corners,
+        "AwayCorners": away_corners,
+        "HomeFouls": home_fouls,
+        "AwayFouls": away_fouls,
+        "HY": home_yellow,
+        "AY": away_yellow,
+        "HR": home_red,
+        "AR": away_red,
+        "HomeForm": home_form,
+        "AwayForm": away_form,
+        "FormDiff": home_form - away_form,
+        "HomeAdvantage": 1.0,
+        "ShotsDiff": home_shots - away_shots,
+        "ShotsOnTargetDiff": home_sot - away_sot,
+        "FoulsDiff": home_fouls - away_fouls,
+        "YellowDiff": home_yellow - away_yellow,
+        "RedDiff": home_red - away_red,
+        "HomeAvgGoalsScored": home_avg_scored,
+        "HomeAvgGoalsConceded": home_avg_conceded,
+        "AwayAvgGoalsScored": away_avg_scored,
+        "AwayAvgGoalsConceded": away_avg_conceded,
+        "HomeGoalDiffTrend": home_goal_diff_trend,
+        "AwayGoalDiffTrend": away_goal_diff_trend,
+        "MatchNumber": match_number,
+        "TotalMatches": total_matches,
+        "SeasonProgress": season_progress,
+        "SeasonAvgPoints_Home": season_avg_points_home,
+        "SeasonAvgPoints_Away": season_avg_points_away,
+        "Points_HomeBefore": points_home_before,
+        "Points_AwayBefore": points_away_before,
+        "PointsGap_HomeAway": points_gap,
+        "RelegationPressure_Home": relegation_pressure_home,
     }
 
-
-def _team_points_per_match(matches, is_home_side):
-    if matches.empty or "FullTimeResult" not in matches.columns:
-        return 1.33
-    if is_home_side:
-        wins = (matches["FullTimeResult"] == "H").sum()
-        draws = (matches["FullTimeResult"] == "D").sum()
+    if hasattr(scaler, "feature_names_in_"):
+        ordered_columns = [str(c) for c in scaler.feature_names_in_]
     else:
-        wins = (matches["FullTimeResult"] == "A").sum()
-        draws = (matches["FullTimeResult"] == "D").sum()
-    return float((wins * 3 + draws) / max(len(matches), 1))
+        ordered_columns = MODEL_FEATURE_ORDER
+
+    row = {name: float(feature_values.get(name, 0.0)) for name in ordered_columns}
+    feature_df = pd.DataFrame([row], columns=ordered_columns)
+    model_input = scaler.transform(feature_df)
+    return np.asarray(model_input, dtype=np.float32)
 
 
-def _build_team_profile(season_data, team, side, baselines):
-    if side == "home":
-        matches = season_data[season_data["HomeTeam"] == team].copy()
-        profile = {
-            "gf": _safe_column_mean(matches, "FTHG", baselines["gf_home"]),
-            "ga": _safe_column_mean(matches, "FTAG", baselines["ga_home"]),
-            "sf": _safe_column_mean(matches, "HomeShots", baselines["sf_home"]),
-            "sa": _safe_column_mean(matches, "AwayShots", baselines["sa_home"]),
-            "sotf": _safe_column_mean(matches, "HomeShotsOnTarget", baselines["sotf_home"]),
-            "sota": _safe_column_mean(matches, "AwayShotsOnTarget", baselines["sota_home"]),
-            "cf": _safe_column_mean(matches, "HomeCorners", baselines["cf_home"]),
-            "ca": _safe_column_mean(matches, "AwayCorners", baselines["ca_home"]),
-            "ff": _safe_column_mean(matches, "HomeFouls", baselines["ff_home"]),
-            "fa": _safe_column_mean(matches, "AwayFouls", baselines["fa_home"]),
-            "yc": _safe_column_mean(matches, "HY", baselines["yc_home"]),
-            "rc": _safe_column_mean(matches, "HR", baselines["rc_home"]),
-            "ppm": _team_points_per_match(matches, is_home_side=True),
-        }
-    else:
-        matches = season_data[season_data["AwayTeam"] == team].copy()
-        profile = {
-            "gf": _safe_column_mean(matches, "FTAG", baselines["gf_away"]),
-            "ga": _safe_column_mean(matches, "FTHG", baselines["ga_away"]),
-            "sf": _safe_column_mean(matches, "AwayShots", baselines["sf_away"]),
-            "sa": _safe_column_mean(matches, "HomeShots", baselines["sa_away"]),
-            "sotf": _safe_column_mean(matches, "AwayShotsOnTarget", baselines["sotf_away"]),
-            "sota": _safe_column_mean(matches, "HomeShotsOnTarget", baselines["sota_away"]),
-            "cf": _safe_column_mean(matches, "AwayCorners", baselines["cf_away"]),
-            "ca": _safe_column_mean(matches, "HomeCorners", baselines["ca_away"]),
-            "ff": _safe_column_mean(matches, "AwayFouls", baselines["ff_away"]),
-            "fa": _safe_column_mean(matches, "HomeFouls", baselines["fa_away"]),
-            "yc": _safe_column_mean(matches, "AY", baselines["yc_away"]),
-            "rc": _safe_column_mean(matches, "AR", baselines["rc_away"]),
-            "ppm": _team_points_per_match(matches, is_home_side=False),
-        }
-    return profile
+def _poisson_pmf(k, lam):
+    lam = max(float(lam), 0.05)
+    return (math.exp(-lam) * (lam ** k)) / math.factorial(k)
 
 
-def build_model_input_from_stats(season_data, home_team, away_team, feature_count=36):
-    baselines = _get_season_baselines(season_data)
-    home_profile = _build_team_profile(season_data, home_team, "home", baselines)
-    away_profile = _build_team_profile(season_data, away_team, "away", baselines)
+def compute_poisson_probabilities(season_data, home_team, away_team, max_goals=7):
+    home_rows = season_data[season_data["HomeTeam"] == home_team]
+    away_rows = season_data[season_data["AwayTeam"] == away_team]
 
-    home_features = [
-        home_profile["gf"], home_profile["ga"], home_profile["sf"], home_profile["sa"],
-        home_profile["sotf"], home_profile["sota"], home_profile["cf"], home_profile["ca"],
-        home_profile["ff"], home_profile["fa"], home_profile["yc"], home_profile["rc"],
-        home_profile["ppm"],
-    ]
-    away_features = [
-        away_profile["gf"], away_profile["ga"], away_profile["sf"], away_profile["sa"],
-        away_profile["sotf"], away_profile["sota"], away_profile["cf"], away_profile["ca"],
-        away_profile["ff"], away_profile["fa"], away_profile["yc"], away_profile["rc"],
-        away_profile["ppm"],
-    ]
+    league_home_goals = _safe_mean(season_data, "FTHG", 1.4)
+    league_away_goals = _safe_mean(season_data, "FTAG", 1.1)
 
-    matchup_features = [
-        home_profile["gf"] - away_profile["ga"],
-        away_profile["gf"] - home_profile["ga"],
-        home_profile["ppm"] - away_profile["ppm"],
-        home_profile["sotf"] - away_profile["sota"],
-        away_profile["sotf"] - home_profile["sota"],
-        home_profile["sf"] - away_profile["sa"],
-        away_profile["sf"] - home_profile["sa"],
-        home_profile["cf"] - away_profile["ca"],
-        home_profile["yc"] - away_profile["yc"],
-        home_profile["rc"] - away_profile["rc"],
-    ]
+    home_avg_scored = _safe_mean(home_rows, "FTHG", league_home_goals)
+    home_avg_conceded = _safe_mean(home_rows, "FTAG", league_away_goals)
+    away_avg_scored = _safe_mean(away_rows, "FTAG", league_away_goals)
+    away_avg_conceded = _safe_mean(away_rows, "FTHG", league_home_goals)
 
-    features = home_features + away_features + matchup_features
-    if len(features) < feature_count:
-        features.extend([0.0] * (feature_count - len(features)))
-    elif len(features) > feature_count:
-        features = features[:feature_count]
+    home_attack = home_avg_scored / max(league_home_goals, 0.05)
+    home_defense = home_avg_conceded / max(league_away_goals, 0.05)
+    away_attack = away_avg_scored / max(league_away_goals, 0.05)
+    away_defense = away_avg_conceded / max(league_home_goals, 0.05)
 
-    return np.asarray([features], dtype=np.float32)
+    expected_home_goals = league_home_goals * home_attack * away_defense
+    expected_away_goals = league_away_goals * away_attack * home_defense
+
+    home_win = 0.0
+    draw = 0.0
+    away_win = 0.0
+
+    for hg in range(max_goals + 1):
+        p_h = _poisson_pmf(hg, expected_home_goals)
+        for ag in range(max_goals + 1):
+            p_a = _poisson_pmf(ag, expected_away_goals)
+            p = p_h * p_a
+            if hg > ag:
+                home_win += p
+            elif hg == ag:
+                draw += p
+            else:
+                away_win += p
+
+    probs = np.asarray([home_win, draw, away_win], dtype=np.float32)
+    probs = probs / max(probs.sum(), 1e-8)
+    return probs
 
 
 # 3. BUILD SLIDER HTML
@@ -525,8 +635,30 @@ with col_btn_2:
                 time.sleep(1.2)
 
                 model_input = build_model_input_from_stats(season_data, home_team, away_team)
-                prediction = model.predict(model_input)[0]
+                model_probs = np.asarray(model.predict(model_input)[0], dtype=np.float32)
+                if model_probs.shape[0] != 3 or not np.isfinite(model_probs).all():
+                    model_probs = np.asarray([1/3, 1/3, 1/3], dtype=np.float32)
+                else:
+                    model_probs = model_probs / max(model_probs.sum(), 1e-8)
+
+                # Prevent pathological overconfidence from out-of-distribution feature inputs.
+                if float(model_probs.max()) > 0.9:
+                    model_probs = 0.65 * model_probs + 0.35 * np.asarray([1/3, 1/3, 1/3], dtype=np.float32)
+
+                poisson_probs = compute_poisson_probabilities(season_data, home_team, away_team)
+
+                # Hybrid forecast: data-driven Poisson baseline + neural model signal.
+                prediction = 0.8 * poisson_probs + 0.2 * model_probs
+                prediction = prediction / max(prediction.sum(), 1e-8)
                 st.session_state['prediction'] = prediction
+                st.session_state['prediction_debug'] = {
+                    'model_probs': model_probs,
+                    'poisson_probs': poisson_probs,
+                    'final_probs': prediction,
+                    'home_team': home_team,
+                    'away_team': away_team,
+                    'season': selected_season,
+                }
 
 # --- RESULTS SECTION ---
 if st.session_state['prediction'] is not None:
@@ -537,12 +669,12 @@ if st.session_state['prediction'] is not None:
     prediction = st.session_state['prediction']
     idx = np.argmax(prediction)
     confidence = prediction[idx] * 100
-    outcomes = ["AWAY WIN", "DRAW", "HOME WIN"]
+    outcomes = ["HOME WIN", "DRAW", "AWAY WIN"]
     result_text = outcomes[idx]
     
     # Updated Colors for Light Theme
     # Home (Blue), Away (Purple), Draw (Dark Gray)
-    res_color = "#0052cc" if idx == 2 else "#6b38c7" if idx == 0 else "#172b4d"
+    res_color = "#0052cc" if idx == 0 else "#6b38c7" if idx == 2 else "#172b4d"
 
     # Split Layout for Results
     res_c1, res_c2 = st.columns(2)
@@ -561,7 +693,7 @@ if st.session_state['prediction'] is not None:
     with res_c2:
         chart_data = pd.DataFrame({
             'Outcome': ['HOME', 'DRAW', 'AWAY'],
-            'Probability': [prediction[2], prediction[1], prediction[0]],
+            'Probability': [prediction[0], prediction[1], prediction[2]],
             'Color': ['#0052cc', '#97a0af', '#6b38c7'] # Blue, Gray, Purple
         })
 
@@ -582,5 +714,20 @@ if st.session_state['prediction'] is not None:
         )
 
         st.altair_chart(c, use_container_width=True)
+
+    debug_payload = st.session_state.get('prediction_debug')
+    if debug_payload is not None:
+        with st.expander("Show Prediction Debug (Model vs Poisson vs Final)"):
+            st.caption(
+                f"Season: {debug_payload['season']} | Match: {debug_payload['home_team']} vs {debug_payload['away_team']}"
+            )
+            debug_df = pd.DataFrame({
+                'Outcome': ['HOME WIN', 'DRAW', 'AWAY WIN'],
+                'Model': np.round(np.asarray(debug_payload['model_probs']) * 100, 2),
+                'Poisson': np.round(np.asarray(debug_payload['poisson_probs']) * 100, 2),
+                'Final': np.round(np.asarray(debug_payload['final_probs']) * 100, 2),
+            })
+            st.dataframe(debug_df, use_container_width=True, hide_index=True)
+            st.caption("Final = 80% Poisson + 20% Model (with confidence damping when model is too sharp).")
 
 st.markdown('</div>', unsafe_allow_html=True)
