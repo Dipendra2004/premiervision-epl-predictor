@@ -30,7 +30,14 @@ PremierVision is a Streamlit web app that predicts EPL match outcomes (Home Win,
 - scaler.pkl: Saved scaler artifact from model training workflow
 - requirements.txt: Python dependencies
 - .gitignore: Git ignore rules
+- assets/images/: Project screenshots folder
 - SOCIAL_PREVIEW_CANVA.md: Ready-to-use social preview design guide
+
+## Project Preview
+
+![Project Preview 1](assets/images/preview-1.png)
+
+![Project Preview 2](assets/images/preview-2.png)
 
 ## How Predictions Work
 
