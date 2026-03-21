@@ -696,22 +696,12 @@ with col_btn_2:
 
                 poisson_probs = compute_poisson_probabilities(season_data, home_team, away_team)
                 rating_probs = compute_rating_probabilities(season_data, home_team, away_team)
-                home_ppm = _team_total_points(season_data, home_team) / max(_team_total_matches(season_data, home_team), 1)
-                away_ppm = _team_total_points(season_data, away_team) / max(_team_total_matches(season_data, away_team), 1)
-                ppm_edge = away_ppm - home_ppm
 
                 # Hybrid forecast balances rating, Poisson, and model signal.
                 prediction = 0.55 * rating_probs + 0.35 * poisson_probs + 0.10 * model_probs
                 balance = 1.0 - abs(float(rating_probs[0] - rating_probs[2]))
                 draw_uplift = 0.08 * max(balance, 0.0)
                 prediction[1] = prediction[1] + draw_uplift
-
-                # If away side is materially stronger, reduce persistent home skew.
-                if ppm_edge > 0.20:
-                    away_boost = min(0.20, 0.35 * (ppm_edge - 0.20))
-                    prediction[2] = prediction[2] + away_boost
-                    prediction[0] = max(prediction[0] - away_boost, 0.01)
-
                 prediction = prediction / max(prediction.sum(), 1e-8)
                 st.session_state['prediction'] = prediction
                 st.session_state['prediction_debug'] = {
@@ -719,7 +709,6 @@ with col_btn_2:
                     'poisson_probs': poisson_probs,
                     'rating_probs': rating_probs,
                     'final_probs': prediction,
-                    'ppm_edge': ppm_edge,
                     'home_team': home_team,
                     'away_team': away_team,
                     'season': selected_season,
@@ -786,7 +775,6 @@ if st.session_state['prediction'] is not None:
             st.caption(
                 f"Season: {debug_payload['season']} | Match: {debug_payload['home_team']} vs {debug_payload['away_team']}"
             )
-            st.caption(f"Away PPM Edge: {float(debug_payload.get('ppm_edge', 0.0)):.3f}")
             debug_df = pd.DataFrame({
                 'Outcome': ['HOME WIN', 'DRAW', 'AWAY WIN'],
                 'Model': np.round(np.asarray(debug_payload['model_probs']) * 100, 2),
